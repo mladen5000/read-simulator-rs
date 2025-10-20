@@ -567,11 +567,11 @@ fn write_fastq(
             let r2_file_handle = File::create(&r2_file)?;
             let mut r1_writer = BufWriter::with_capacity(
                 1024 * 1024,
-                GzEncoder::new(r1_file_handle, Compression::default()),
+                GzEncoder::new(r1_file_handle, Compression::fast()),
             );
             let mut r2_writer = BufWriter::with_capacity(
                 1024 * 1024,
-                GzEncoder::new(r2_file_handle, Compression::default()),
+                GzEncoder::new(r2_file_handle, Compression::fast()),
             );
 
             for read in reads {
@@ -648,7 +648,7 @@ fn write_fastq(
             let file_handle = File::create(&out_file)?;
             let mut writer = BufWriter::with_capacity(
                 1024 * 1024,
-                GzEncoder::new(file_handle, Compression::default()),
+                GzEncoder::new(file_handle, Compression::fast()),
             );
 
             for read in reads {
@@ -711,9 +711,9 @@ struct Cli {
     #[arg(long)]
     single_end: bool,
 
-    /// Do not gzip output files
+    /// Gzip compress output files (slower but saves disk space)
     #[arg(long)]
-    no_gzip: bool,
+    gzip: bool,
 
     /// Random seed for reproducibility
     #[arg(long)]
@@ -721,6 +721,8 @@ struct Cli {
 }
 
 fn main() -> io::Result<()> {
+    use std::time::Instant;
+
     let cli = Cli::parse();
 
     let tech = match cli.tech {
@@ -738,10 +740,13 @@ fn main() -> io::Result<()> {
     println!("  Target coverage: {:.1}X", cli.coverage);
 
     println!("\nReading sequences from {:?}...", cli.input);
+    let start = Instant::now();
     let sequences = parse_fasta(&cli.input)?;
+    eprintln!("[TIMING] FASTA parsing: {:?}", start.elapsed());
     println!("Found {} sequence(s)", sequences.len());
 
     // Quick Win: Conditional parallelization - only parallelize for multi-sequence files
+    let start = Instant::now();
     let all_reads: Vec<ReadData> = if sequences.len() == 1 {
         // Single sequence: sequential processing (avoid Rayon overhead)
         sequences
@@ -763,6 +768,7 @@ fn main() -> io::Result<()> {
             })
             .collect()
     };
+    eprintln!("[TIMING] Read generation: {:?}", start.elapsed());
 
     println!(
         "\nGenerated {} read{}(s)",
@@ -770,7 +776,9 @@ fn main() -> io::Result<()> {
         if tech.paired_end { " pair" } else { "" }
     );
 
-    write_fastq(&all_reads, &cli.output, tech.paired_end, !cli.no_gzip)?;
+    let start = Instant::now();
+    write_fastq(&all_reads, &cli.output, tech.paired_end, cli.gzip)?;
+    eprintln!("[TIMING] FASTQ writing: {:?}", start.elapsed());
     println!("Done!");
 
     Ok(())
