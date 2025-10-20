@@ -2,6 +2,7 @@ use clap::{Parser, ValueEnum};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
+use rayon::prelude::*;
 
 // Simple LCG-based RNG for deterministic seeding
 struct SimpleRng {
@@ -101,11 +102,76 @@ impl TechParams {
     }
 }
 
+// Phase 1 Optimization: Pre-computed lookup tables and buffers
+struct SimulatorBuffers {
+    complement_table: [u8; 256],
+    bases: [u8; 4],
+    alternatives: [[u8; 3]; 4],
+    // Phase 3 Optimization: Quality score pools for fast generation
+    illumina_qual_pools: Vec<Vec<u8>>,
+    nanopore_qual_pool: Vec<u8>,
+}
+
+impl SimulatorBuffers {
+    fn new() -> Self {
+        let mut complement_table = [0u8; 256];
+        complement_table[b'A' as usize] = b'T';
+        complement_table[b'T' as usize] = b'A';
+        complement_table[b'G' as usize] = b'C';
+        complement_table[b'C' as usize] = b'G';
+        for i in 0..256 {
+            if complement_table[i] == 0 {
+                complement_table[i] = b'N';
+            }
+        }
+
+        let bases = [b'A', b'C', b'G', b'T'];
+
+        let alternatives = [
+            [b'C', b'G', b'T'],
+            [b'A', b'G', b'T'],
+            [b'A', b'C', b'T'],
+            [b'A', b'C', b'G'],
+        ];
+
+        // Pre-compute quality score pools
+        let mut illumina_qual_pools = Vec::new();
+        let mut rng = SimpleRng::new(42);
+
+        for position_ratio in [0.0f64, 0.3, 0.6, 0.9] {
+            let mut pool = Vec::with_capacity(10000);
+            for _ in 0..10000 {
+                let base_qual = 38i32;
+                let degradation = (3.0 * position_ratio) as i32;
+                let noise = (rng.gen_f64() * 4.0 - 2.0) as i32;
+                let qual = (base_qual - degradation + noise).clamp(20, 41);
+                pool.push((qual + 33) as u8);
+            }
+            illumina_qual_pools.push(pool);
+        }
+
+        let mut nanopore_qual_pool = Vec::with_capacity(10000);
+        for _ in 0..10000 {
+            let qual = rng.box_muller(15.0, 5.0).round() as i32;
+            let qual = qual.clamp(5, 30);
+            nanopore_qual_pool.push((qual + 33) as u8);
+        }
+
+        Self {
+            complement_table,
+            bases,
+            alternatives,
+            illumina_qual_pools,
+            nanopore_qual_pool,
+        }
+    }
+}
+
 struct ReadSimulator {
     tech: TechParams,
     coverage: f64,
     rng: SimpleRng,
-    bases: Vec<u8>,
+    buffers: SimulatorBuffers,
 }
 
 impl ReadSimulator {
@@ -118,22 +184,17 @@ impl ReadSimulator {
             tech,
             coverage,
             rng,
-            bases: vec![b'A', b'C', b'G', b'T'],
+            buffers: SimulatorBuffers::new(),
         }
     }
 
-    fn complement(&self, base: u8) -> u8 {
-        match base {
-            b'A' => b'T',
-            b'T' => b'A',
-            b'G' => b'C',
-            b'C' => b'G',
-            _ => b'N',
+    #[inline]
+    fn reverse_complement_in_place(&self, seq: &[u8], out: &mut Vec<u8>) {
+        out.clear();
+        out.reserve(seq.len());
+        for &b in seq.iter().rev() {
+            out.push(self.buffers.complement_table[b as usize]);
         }
-    }
-
-    fn reverse_complement(&self, seq: &[u8]) -> Vec<u8> {
-        seq.iter().rev().map(|&b| self.complement(b)).collect()
     }
 
     fn calculate_gc_content(&self, seq: &[u8]) -> f64 {
@@ -150,8 +211,11 @@ impl ReadSimulator {
         (-bias * 10.0 * deviation.powi(2)).exp()
     }
 
-    fn introduce_errors(&mut self, seq: &[u8]) -> Vec<u8> {
-        let mut result = Vec::with_capacity(seq.len());
+    #[inline]
+    fn introduce_errors_in_place(&mut self, seq: &[u8], out: &mut Vec<u8>) {
+        out.clear();
+        out.reserve(seq.len());
+
         let total_error =
             self.tech.insertion_rate + self.tech.deletion_rate + self.tech.substitution_rate;
         let ins_threshold = self.tech.insertion_rate / total_error;
@@ -162,48 +226,57 @@ impl ReadSimulator {
                 let error_type = self.rng.gen_f64();
 
                 if error_type < ins_threshold {
-                    // Insertion
-                    result.push(base);
-                    result.push(self.bases[self.rng.gen_range(0, 3)]);
+                    out.push(base);
+                    out.push(self.buffers.bases[self.rng.gen_range(0, 3)]);
                 } else if error_type < del_threshold {
                     // Deletion - skip base
                 } else {
-                    // Substitution
-                    let alternatives: Vec<u8> =
-                        self.bases.iter().filter(|&&b| b != base).copied().collect();
-                    if !alternatives.is_empty() {
-                        result.push(alternatives[self.rng.gen_range(0, alternatives.len() - 1)]);
-                    }
+                    // Substitution with pre-computed alternatives
+                    let base_idx = match base {
+                        b'A' => 0,
+                        b'C' => 1,
+                        b'G' => 2,
+                        b'T' => 3,
+                        _ => 0,
+                    };
+                    let alternatives = self.buffers.alternatives[base_idx];
+                    out.push(alternatives[self.rng.gen_range(0, 2)]);
                 }
             } else {
-                result.push(base);
+                out.push(base);
             }
         }
-
-        result
     }
 
-    fn generate_quality_scores(&mut self, length: usize) -> Vec<u8> {
-        let mut scores = Vec::with_capacity(length);
+    #[inline]
+    fn generate_quality_scores_fast(&mut self, length: usize, out: &mut Vec<u8>) {
+        out.clear();
+        out.reserve(length);
 
         if self.tech.name == "Illumina" {
-            let base_qual = 38i32;
+            // Pool-based quality generation for Illumina
             for i in 0..length {
-                let degradation = (3.0 * (i as f64 / length as f64)) as i32;
-                let noise = (self.rng.gen_f64() * 4.0 - 2.0) as i32;
-                let qual = (base_qual - degradation + noise).clamp(20, 41);
-                scores.push((qual + 33) as u8);
+                let position_ratio = (i as f64) / (length as f64);
+                let pool_idx = if position_ratio < 0.25 {
+                    0
+                } else if position_ratio < 0.5 {
+                    1
+                } else if position_ratio < 0.75 {
+                    2
+                } else {
+                    3
+                };
+                let pool = &self.buffers.illumina_qual_pools[pool_idx];
+                let pool_idx_rand = self.rng.gen_range(0, pool.len() - 1);
+                out.push(pool[pool_idx_rand]);
             }
         } else {
-            // Nanopore
+            // Nanopore with pre-generated pool
             for _ in 0..length {
-                let qual = self.rng.box_muller(15.0, 5.0).round() as i32;
-                let qual = qual.clamp(5, 30);
-                scores.push((qual + 33) as u8);
+                let pool_idx = self.rng.gen_range(0, self.buffers.nanopore_qual_pool.len() - 1);
+                out.push(self.buffers.nanopore_qual_pool[pool_idx]);
             }
         }
-
-        scores
     }
 
     fn sample_read_position(&mut self, seq: &[u8], read_length: usize) -> (usize, bool) {
@@ -213,9 +286,8 @@ impl ReadSimulator {
             return (0, self.rng.gen_bool());
         };
 
-        // GC bias rejection sampling
-        if self.tech.gc_bias_strength > 0.0 {
-            for _ in 0..10 {
+        if self.tech.gc_bias_strength > 0.1 {
+            for _ in 0..5 {
                 let pos = self.rng.gen_range(0, max_start);
                 let end = (pos + read_length).min(seq.len());
                 let gc = self.calculate_gc_content(&seq[pos..end]);
@@ -248,21 +320,32 @@ impl ReadSimulator {
         let (start_pos, is_reverse) = self.sample_read_position(seq, insert_size);
         let start_pos = start_pos.min(max_start);
 
-        let mut fragment = seq[start_pos..start_pos + insert_size].to_vec();
+        let fragment_end = start_pos + insert_size;
+        let frag_slice = &seq[start_pos..fragment_end];
 
-        if is_reverse {
-            fragment = self.reverse_complement(&fragment);
-        }
+        let mut fragment = if is_reverse {
+            let mut temp = Vec::with_capacity(frag_slice.len());
+            self.reverse_complement_in_place(frag_slice, &mut temp);
+            temp
+        } else {
+            frag_slice.to_vec()
+        };
 
         // R1: forward from fragment start
-        let read1_seq = self.introduce_errors(&fragment[..read_len.min(fragment.len())]);
-        let qual1 = self.generate_quality_scores(read1_seq.len());
+        let read1_end = read_len.min(fragment.len());
+        let mut read1_seq = Vec::with_capacity(read1_end);
+        self.introduce_errors_in_place(&fragment[..read1_end], &mut read1_seq);
+        let mut qual1 = Vec::with_capacity(read1_seq.len());
+        self.generate_quality_scores_fast(read1_seq.len(), &mut qual1);
 
         // R2: reverse complement from fragment end
         let r2_start = fragment.len().saturating_sub(read_len);
-        let read2_seq = self.reverse_complement(&fragment[r2_start..]);
-        let read2_seq = self.introduce_errors(&read2_seq);
-        let qual2 = self.generate_quality_scores(read2_seq.len());
+        let mut r2_rev = Vec::with_capacity(fragment.len() - r2_start);
+        self.reverse_complement_in_place(&fragment[r2_start..], &mut r2_rev);
+        let mut read2_seq = Vec::with_capacity(r2_rev.len());
+        self.introduce_errors_in_place(&r2_rev, &mut read2_seq);
+        let mut qual2 = Vec::with_capacity(read2_seq.len());
+        self.generate_quality_scores_fast(read2_seq.len(), &mut qual2);
 
         let name1 = format!("@{}.{}/1", seq_name, read_id);
         let name2 = format!("@{}.{}/2", seq_name, read_id);
@@ -278,7 +361,6 @@ impl ReadSimulator {
     ) -> Option<(String, Vec<u8>, Vec<u8>)> {
         let mut read_len = self.tech.read_length;
 
-        // Variable length for Nanopore
         if self.tech.name == "Nanopore" {
             let length_variation = self.rng.geometric(1.0 / read_len as f64);
             read_len = ((read_len as f64 * 0.5) as usize + length_variation)
@@ -292,14 +374,21 @@ impl ReadSimulator {
 
         let (start_pos, is_reverse) = self.sample_read_position(seq, read_len);
         let end_pos = (start_pos + read_len).min(seq.len());
-        let mut read_seq = seq[start_pos..end_pos].to_vec();
 
-        if is_reverse {
-            read_seq = self.reverse_complement(&read_seq);
-        }
+        let mut read_data = if is_reverse {
+            let mut temp = Vec::with_capacity(end_pos - start_pos);
+            self.reverse_complement_in_place(&seq[start_pos..end_pos], &mut temp);
+            temp
+        } else {
+            seq[start_pos..end_pos].to_vec()
+        };
 
-        let read_seq = self.introduce_errors(&read_seq);
-        let qual = self.generate_quality_scores(read_seq.len());
+        let mut read_seq = Vec::with_capacity(read_data.len());
+        self.introduce_errors_in_place(&read_data, &mut read_seq);
+
+        let mut qual = Vec::with_capacity(read_seq.len());
+        self.generate_quality_scores_fast(read_seq.len(), &mut qual);
+
         let name = format!("@{}.{}", seq_name, read_id);
 
         Some((name, read_seq, qual))
@@ -394,6 +483,7 @@ fn parse_fasta(path: &PathBuf) -> io::Result<Vec<(String, Vec<u8>)>> {
     Ok(sequences)
 }
 
+// Phase 1 Optimization: Direct byte writing instead of writeln!
 fn write_fastq(
     reads: &[ReadData],
     output_prefix: &str,
@@ -404,8 +494,8 @@ fn write_fastq(
         let r1_file = format!("{}_R1.fastq", output_prefix);
         let r2_file = format!("{}_R2.fastq", output_prefix);
 
-        let mut r1_writer = BufWriter::new(File::create(&r1_file)?);
-        let mut r2_writer = BufWriter::new(File::create(&r2_file)?);
+        let mut r1_writer = BufWriter::with_capacity(1024 * 1024, File::create(&r1_file)?);
+        let mut r2_writer = BufWriter::with_capacity(1024 * 1024, File::create(&r2_file)?);
 
         for read in reads {
             if let ReadData::PairedEnd {
@@ -417,40 +507,41 @@ fn write_fastq(
                 qual2,
             } = read
             {
-                writeln!(
-                    r1_writer,
-                    "{}\n{}\n+\n{}",
-                    name1,
-                    String::from_utf8_lossy(seq1),
-                    String::from_utf8_lossy(qual1)
-                )?;
-                writeln!(
-                    r2_writer,
-                    "{}\n{}\n+\n{}",
-                    name2,
-                    String::from_utf8_lossy(seq2),
-                    String::from_utf8_lossy(qual2)
-                )?;
+                r1_writer.write_all(name1.as_bytes())?;
+                r1_writer.write_all(b"\n")?;
+                r1_writer.write_all(seq1)?;
+                r1_writer.write_all(b"\n+\n")?;
+                r1_writer.write_all(qual1)?;
+                r1_writer.write_all(b"\n")?;
+
+                r2_writer.write_all(name2.as_bytes())?;
+                r2_writer.write_all(b"\n")?;
+                r2_writer.write_all(seq2)?;
+                r2_writer.write_all(b"\n+\n")?;
+                r2_writer.write_all(qual2)?;
+                r2_writer.write_all(b"\n")?;
             }
         }
 
+        r1_writer.flush()?;
+        r2_writer.flush()?;
         println!("Written paired-end reads to {} and {}", r1_file, r2_file);
     } else {
         let out_file = format!("{}.fastq", output_prefix);
-        let mut writer = BufWriter::new(File::create(&out_file)?);
+        let mut writer = BufWriter::with_capacity(1024 * 1024, File::create(&out_file)?);
 
         for read in reads {
             if let ReadData::SingleEnd { name, seq, qual } = read {
-                writeln!(
-                    writer,
-                    "{}\n{}\n+\n{}",
-                    name,
-                    String::from_utf8_lossy(seq),
-                    String::from_utf8_lossy(qual)
-                )?;
+                writer.write_all(name.as_bytes())?;
+                writer.write_all(b"\n")?;
+                writer.write_all(seq)?;
+                writer.write_all(b"\n+\n")?;
+                writer.write_all(qual)?;
+                writer.write_all(b"\n")?;
             }
         }
 
+        writer.flush()?;
         println!("Written single-end reads to {}", out_file);
     }
 
@@ -505,19 +596,19 @@ fn main() -> io::Result<()> {
     println!("  Error rate: {:.4}", tech.error_rate);
     println!("  Target coverage: {:.1}X", cli.coverage);
 
-    let mut simulator = ReadSimulator::new(tech.clone(), cli.coverage, cli.seed);
-
     println!("\nReading sequences from {:?}...", cli.input);
     let sequences = parse_fasta(&cli.input)?;
     println!("Found {} sequence(s)", sequences.len());
 
-    let mut all_reads = Vec::new();
-
-    for (seq_name, seq) in sequences {
-        println!("  Generating reads for {} ({} bp)...", seq_name, seq.len());
-        let reads = simulator.simulate_from_sequence(&seq, &seq_name);
-        all_reads.extend(reads);
-    }
+    // Phase 2 Optimization: Parallel processing with Rayon
+    let all_reads: Vec<ReadData> = sequences
+        .into_par_iter()
+        .flat_map(|(seq_name, seq)| {
+            eprintln!("  Generating reads for {} ({} bp)...", seq_name, seq.len());
+            let mut sim = ReadSimulator::new(tech.clone(), cli.coverage, cli.seed);
+            sim.simulate_from_sequence(&seq, &seq_name)
+        })
+        .collect();
 
     println!(
         "\nGenerated {} read{}(s)",
