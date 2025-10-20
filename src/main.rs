@@ -1,4 +1,6 @@
 use clap::{Parser, ValueEnum};
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
@@ -60,6 +62,15 @@ impl SimpleRng {
 enum SeqTech {
     Illumina,
     Nanopore,
+    /// PacBio HiFi (Circular Consensus Sequencing)
+    #[value(name = "pacbio")]
+    PacBio,
+    /// Illumina NovaSeq 6000
+    #[value(name = "novaseq")]
+    NovaSeq,
+    /// Oxford Nanopore MinION R10.4
+    #[value(name = "minion")]
+    MinION,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +111,46 @@ impl TechParams {
             gc_bias_strength: 0.15,
         }
     }
+
+    // Quick Win: Preset profiles for common platforms
+    fn pacbio() -> Self {
+        Self {
+            name: "PacBio".to_string(),
+            read_length: 15000,
+            paired_end: false,
+            error_rate: 0.002, // HiFi has very low error rate
+            insertion_rate: 0.0008,
+            deletion_rate: 0.0008,
+            substitution_rate: 0.0004,
+            gc_bias_strength: 0.1,
+        }
+    }
+
+    fn novaseq() -> Self {
+        Self {
+            name: "NovaSeq".to_string(),
+            read_length: 150,
+            paired_end: true,
+            error_rate: 0.0008, // Slightly better than standard Illumina
+            insertion_rate: 0.00008,
+            deletion_rate: 0.00008,
+            substitution_rate: 0.00064,
+            gc_bias_strength: 0.25,
+        }
+    }
+
+    fn minion() -> Self {
+        Self {
+            name: "MinION".to_string(),
+            read_length: 12000,
+            paired_end: false,
+            error_rate: 0.04, // R10.4 chemistry
+            insertion_rate: 0.015,
+            deletion_rate: 0.015,
+            substitution_rate: 0.01,
+            gc_bias_strength: 0.12,
+        }
+    }
 }
 
 // Phase 1 Optimization: Pre-computed lookup tables and buffers
@@ -107,6 +158,7 @@ struct SimulatorBuffers {
     complement_table: [u8; 256],
     bases: [u8; 4],
     alternatives: [[u8; 3]; 4],
+    base_to_idx: [u8; 256],  // Quick Win: Base to index lookup
     // Phase 3 Optimization: Quality score pools for fast generation
     illumina_qual_pools: Vec<Vec<u8>>,
     nanopore_qual_pool: Vec<u8>,
@@ -134,13 +186,21 @@ impl SimulatorBuffers {
             [b'A', b'C', b'G'],
         ];
 
-        // Pre-compute quality score pools
+        // Quick Win: Base to index lookup table
+        let mut base_to_idx = [0u8; 256];
+        base_to_idx[b'A' as usize] = 0;
+        base_to_idx[b'C' as usize] = 1;
+        base_to_idx[b'G' as usize] = 2;
+        base_to_idx[b'T' as usize] = 3;
+
+        // Pre-compute quality score pools (power-of-2 size for fast bit masking)
         let mut illumina_qual_pools = Vec::new();
         let mut rng = SimpleRng::new(42);
+        const POOL_SIZE: usize = 16384; // 2^14 for fast bit masking
 
         for position_ratio in [0.0f64, 0.3, 0.6, 0.9] {
-            let mut pool = Vec::with_capacity(10000);
-            for _ in 0..10000 {
+            let mut pool = Vec::with_capacity(POOL_SIZE);
+            for _ in 0..POOL_SIZE {
                 let base_qual = 38i32;
                 let degradation = (3.0 * position_ratio) as i32;
                 let noise = (rng.gen_f64() * 4.0 - 2.0) as i32;
@@ -150,8 +210,8 @@ impl SimulatorBuffers {
             illumina_qual_pools.push(pool);
         }
 
-        let mut nanopore_qual_pool = Vec::with_capacity(10000);
-        for _ in 0..10000 {
+        let mut nanopore_qual_pool = Vec::with_capacity(POOL_SIZE);
+        for _ in 0..POOL_SIZE {
             let qual = rng.box_muller(15.0, 5.0).round() as i32;
             let qual = qual.clamp(5, 30);
             nanopore_qual_pool.push((qual + 33) as u8);
@@ -161,6 +221,7 @@ impl SimulatorBuffers {
             complement_table,
             bases,
             alternatives,
+            base_to_idx,
             illumina_qual_pools,
             nanopore_qual_pool,
         }
@@ -232,14 +293,8 @@ impl ReadSimulator {
                     // Deletion - skip base
                 } else {
                     // Substitution with pre-computed alternatives
-                    let base_idx = match base {
-                        b'A' => 0,
-                        b'C' => 1,
-                        b'G' => 2,
-                        b'T' => 3,
-                        _ => 0,
-                    };
-                    let alternatives = self.buffers.alternatives[base_idx];
+                    let base_idx = self.buffers.base_to_idx[base as usize];
+                    let alternatives = self.buffers.alternatives[base_idx as usize];
                     out.push(alternatives[self.rng.gen_range(0, 2)]);
                 }
             } else {
@@ -254,7 +309,8 @@ impl ReadSimulator {
         out.reserve(length);
 
         if self.tech.name == "Illumina" {
-            // Pool-based quality generation for Illumina
+            // Pool-based quality generation for Illumina with bit masking
+            const POOL_MASK: u64 = 0x3FFF; // 16384 - 1 = 0x3FFF for fast modulo
             for i in 0..length {
                 let position_ratio = (i as f64) / (length as f64);
                 let pool_idx = if position_ratio < 0.25 {
@@ -267,13 +323,15 @@ impl ReadSimulator {
                     3
                 };
                 let pool = &self.buffers.illumina_qual_pools[pool_idx];
-                let pool_idx_rand = self.rng.gen_range(0, pool.len() - 1);
+                // Fast bit masking instead of modulo
+                let pool_idx_rand = (self.rng.next_u64() & POOL_MASK) as usize;
                 out.push(pool[pool_idx_rand]);
             }
         } else {
-            // Nanopore with pre-generated pool
+            // Nanopore with pre-generated pool and bit masking
+            const POOL_MASK: u64 = 0x3FFF;
             for _ in 0..length {
-                let pool_idx = self.rng.gen_range(0, self.buffers.nanopore_qual_pool.len() - 1);
+                let pool_idx = (self.rng.next_u64() & POOL_MASK) as usize;
                 out.push(self.buffers.nanopore_qual_pool[pool_idx]);
             }
         }
@@ -484,64 +542,144 @@ fn parse_fasta(path: &PathBuf) -> io::Result<Vec<(String, Vec<u8>)>> {
 }
 
 // Phase 1 Optimization: Direct byte writing instead of writeln!
+// Quick Win: Gzip compression support
 fn write_fastq(
     reads: &[ReadData],
     output_prefix: &str,
     paired_end: bool,
-    _gzip_output: bool,
+    gzip_output: bool,
 ) -> io::Result<()> {
     if paired_end {
-        let r1_file = format!("{}_R1.fastq", output_prefix);
-        let r2_file = format!("{}_R2.fastq", output_prefix);
+        let (r1_file, r2_file) = if gzip_output {
+            (
+                format!("{}_R1.fastq.gz", output_prefix),
+                format!("{}_R2.fastq.gz", output_prefix),
+            )
+        } else {
+            (
+                format!("{}_R1.fastq", output_prefix),
+                format!("{}_R2.fastq", output_prefix),
+            )
+        };
 
-        let mut r1_writer = BufWriter::with_capacity(1024 * 1024, File::create(&r1_file)?);
-        let mut r2_writer = BufWriter::with_capacity(1024 * 1024, File::create(&r2_file)?);
+        if gzip_output {
+            let r1_file_handle = File::create(&r1_file)?;
+            let r2_file_handle = File::create(&r2_file)?;
+            let mut r1_writer = BufWriter::with_capacity(
+                1024 * 1024,
+                GzEncoder::new(r1_file_handle, Compression::default()),
+            );
+            let mut r2_writer = BufWriter::with_capacity(
+                1024 * 1024,
+                GzEncoder::new(r2_file_handle, Compression::default()),
+            );
 
-        for read in reads {
-            if let ReadData::PairedEnd {
-                name1,
-                seq1,
-                qual1,
-                name2,
-                seq2,
-                qual2,
-            } = read
-            {
-                r1_writer.write_all(name1.as_bytes())?;
-                r1_writer.write_all(b"\n")?;
-                r1_writer.write_all(seq1)?;
-                r1_writer.write_all(b"\n+\n")?;
-                r1_writer.write_all(qual1)?;
-                r1_writer.write_all(b"\n")?;
+            for read in reads {
+                if let ReadData::PairedEnd {
+                    name1,
+                    seq1,
+                    qual1,
+                    name2,
+                    seq2,
+                    qual2,
+                } = read
+                {
+                    r1_writer.write_all(name1.as_bytes())?;
+                    r1_writer.write_all(b"\n")?;
+                    r1_writer.write_all(seq1)?;
+                    r1_writer.write_all(b"\n+\n")?;
+                    r1_writer.write_all(qual1)?;
+                    r1_writer.write_all(b"\n")?;
 
-                r2_writer.write_all(name2.as_bytes())?;
-                r2_writer.write_all(b"\n")?;
-                r2_writer.write_all(seq2)?;
-                r2_writer.write_all(b"\n+\n")?;
-                r2_writer.write_all(qual2)?;
-                r2_writer.write_all(b"\n")?;
+                    r2_writer.write_all(name2.as_bytes())?;
+                    r2_writer.write_all(b"\n")?;
+                    r2_writer.write_all(seq2)?;
+                    r2_writer.write_all(b"\n+\n")?;
+                    r2_writer.write_all(qual2)?;
+                    r2_writer.write_all(b"\n")?;
+                }
             }
+
+            r1_writer.flush()?;
+            r2_writer.flush()?;
+        } else {
+            let mut r1_writer = BufWriter::with_capacity(1024 * 1024, File::create(&r1_file)?);
+            let mut r2_writer = BufWriter::with_capacity(1024 * 1024, File::create(&r2_file)?);
+
+            for read in reads {
+                if let ReadData::PairedEnd {
+                    name1,
+                    seq1,
+                    qual1,
+                    name2,
+                    seq2,
+                    qual2,
+                } = read
+                {
+                    r1_writer.write_all(name1.as_bytes())?;
+                    r1_writer.write_all(b"\n")?;
+                    r1_writer.write_all(seq1)?;
+                    r1_writer.write_all(b"\n+\n")?;
+                    r1_writer.write_all(qual1)?;
+                    r1_writer.write_all(b"\n")?;
+
+                    r2_writer.write_all(name2.as_bytes())?;
+                    r2_writer.write_all(b"\n")?;
+                    r2_writer.write_all(seq2)?;
+                    r2_writer.write_all(b"\n+\n")?;
+                    r2_writer.write_all(qual2)?;
+                    r2_writer.write_all(b"\n")?;
+                }
+            }
+
+            r1_writer.flush()?;
+            r2_writer.flush()?;
         }
 
-        r1_writer.flush()?;
-        r2_writer.flush()?;
         println!("Written paired-end reads to {} and {}", r1_file, r2_file);
     } else {
-        let out_file = format!("{}.fastq", output_prefix);
-        let mut writer = BufWriter::with_capacity(1024 * 1024, File::create(&out_file)?);
+        let out_file = if gzip_output {
+            format!("{}.fastq.gz", output_prefix)
+        } else {
+            format!("{}.fastq", output_prefix)
+        };
 
-        for read in reads {
-            if let ReadData::SingleEnd { name, seq, qual } = read {
-                writer.write_all(name.as_bytes())?;
-                writer.write_all(b"\n")?;
-                writer.write_all(seq)?;
-                writer.write_all(b"\n+\n")?;
-                writer.write_all(qual)?;
-                writer.write_all(b"\n")?;
+        if gzip_output {
+            let file_handle = File::create(&out_file)?;
+            let mut writer = BufWriter::with_capacity(
+                1024 * 1024,
+                GzEncoder::new(file_handle, Compression::default()),
+            );
+
+            for read in reads {
+                if let ReadData::SingleEnd { name, seq, qual } = read {
+                    writer.write_all(name.as_bytes())?;
+                    writer.write_all(b"\n")?;
+                    writer.write_all(seq)?;
+                    writer.write_all(b"\n+\n")?;
+                    writer.write_all(qual)?;
+                    writer.write_all(b"\n")?;
+                }
             }
+
+            writer.flush()?;
+        } else {
+            let mut writer = BufWriter::with_capacity(1024 * 1024, File::create(&out_file)?);
+
+            for read in reads {
+                if let ReadData::SingleEnd { name, seq, qual } = read {
+                    writer.write_all(name.as_bytes())?;
+                    writer.write_all(b"\n")?;
+                    writer.write_all(seq)?;
+                    writer.write_all(b"\n+\n")?;
+                    writer.write_all(qual)?;
+                    writer.write_all(b"\n")?;
+                }
+            }
+
+            writer.flush()?;
         }
 
-        writer.flush()?;
         println!("Written single-end reads to {}", out_file);
     }
 
@@ -588,6 +726,9 @@ fn main() -> io::Result<()> {
     let tech = match cli.tech {
         SeqTech::Illumina => TechParams::illumina(!cli.single_end),
         SeqTech::Nanopore => TechParams::nanopore(),
+        SeqTech::PacBio => TechParams::pacbio(),
+        SeqTech::NovaSeq => TechParams::novaseq(),
+        SeqTech::MinION => TechParams::minion(),
     };
 
     println!("Simulating {} reads...", tech.name);
@@ -600,15 +741,28 @@ fn main() -> io::Result<()> {
     let sequences = parse_fasta(&cli.input)?;
     println!("Found {} sequence(s)", sequences.len());
 
-    // Phase 2 Optimization: Parallel processing with Rayon
-    let all_reads: Vec<ReadData> = sequences
-        .into_par_iter()
-        .flat_map(|(seq_name, seq)| {
-            eprintln!("  Generating reads for {} ({} bp)...", seq_name, seq.len());
-            let mut sim = ReadSimulator::new(tech.clone(), cli.coverage, cli.seed);
-            sim.simulate_from_sequence(&seq, &seq_name)
-        })
-        .collect();
+    // Quick Win: Conditional parallelization - only parallelize for multi-sequence files
+    let all_reads: Vec<ReadData> = if sequences.len() == 1 {
+        // Single sequence: sequential processing (avoid Rayon overhead)
+        sequences
+            .into_iter()
+            .flat_map(|(seq_name, seq)| {
+                eprintln!("  Generating reads for {} ({} bp)...", seq_name, seq.len());
+                let mut sim = ReadSimulator::new(tech.clone(), cli.coverage, cli.seed);
+                sim.simulate_from_sequence(&seq, &seq_name)
+            })
+            .collect()
+    } else {
+        // Multiple sequences: parallel processing with Rayon
+        sequences
+            .into_par_iter()
+            .flat_map(|(seq_name, seq)| {
+                eprintln!("  Generating reads for {} ({} bp)...", seq_name, seq.len());
+                let mut sim = ReadSimulator::new(tech.clone(), cli.coverage, cli.seed);
+                sim.simulate_from_sequence(&seq, &seq_name)
+            })
+            .collect()
+    };
 
     println!(
         "\nGenerated {} read{}(s)",
